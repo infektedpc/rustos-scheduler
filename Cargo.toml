@@ -1,0 +1,13 @@
+[package]
+name = "rustos-scheduler"
+version = "0.1.0"
+edition = "2021"
+description = "no_std round-robin scheduler with priorities, preemptive timer ticks, and x86_64 context switching for a Rust OS"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "rustos_scheduler"
+path = "src/lib.rs"
+
+[profile.dev]
+opt-level = 0
