@@ -78,6 +78,22 @@ impl Scheduler {
         self.tasks.iter().filter(|t| t.is_ready()).count()
     }
 
+    /// True when at least one ring-3 (userspace) task is still alive
+    /// (any state but `Terminated`). The kernel's idle loop uses
+    /// this to decide who owns the keyboard: while a userspace
+    /// program exists, its `read(fd 0)` is the only consumer of
+    /// stdin (serial + the PS/2 key ring) — the idle loop must not
+    /// drain or echo keystrokes itself, or it would steal bytes the
+    /// program is waiting for and echo them twice (Batch 9). Once
+    /// every user task has exited, the idle loop resumes echoing so
+    /// the console stays live. Kernel tasks never count: the worker
+    /// does not read stdin, so it must not silence the echo.
+    pub fn has_live_user_task(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|t| t.is_user && t.state != TaskState::Terminated)
+    }
+
     /// The currently-running task, if any.
     pub fn current_id(&self) -> Option<TaskId> {
         self.current
@@ -127,6 +143,28 @@ impl Scheduler {
         self.next_id += 1;
         self.tasks.push(Task::new(
             id, name, priority, initial_rsp, stack_top, stack_size, entry,
+        ));
+        id
+    }
+
+    /// Create a ring-3 (userspace) task from a prepared kernel stack
+    /// and add it in `Ready` state. `initial_rsp` must come from
+    /// [`crate::context::prepare_ring3_stack`]; `entry_rip` is the
+    /// program's ELF entry point (a raw address, not a Rust fn).
+    /// Returns the assigned id. See [`Task::new_for_user`].
+    pub fn add_user_task(
+        &mut self,
+        name: &'static str,
+        priority: u8,
+        initial_rsp: u64,
+        stack_top: u64,
+        stack_size: usize,
+        entry_rip: u64,
+    ) -> TaskId {
+        let id = TaskId(self.next_id);
+        self.next_id += 1;
+        self.tasks.push(Task::new_for_user(
+            id, name, priority, initial_rsp, stack_top, stack_size, entry_rip,
         ));
         id
     }
@@ -409,6 +447,99 @@ mod tests {
     }
 
     #[test]
+    fn add_user_task_stores_the_raw_entry_and_ring3_stack() {
+        // A ring-3 task created through add_user_task: its
+        // context.rip is the program's ELF entry (a raw address,
+        // not a Rust fn), its context.rsp is the prepared ring-3
+        // stack pointer, and its stack range is the kernel stack
+        // (the one TSS.rsp[0] points at when it runs).
+        use crate::context::{prepare_ring3_stack, Ring3Frame};
+        let mut sched = Scheduler::new();
+        let buf = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 16384]));
+        let frame = Ring3Frame::new(0x400040, 0x7fffd8, 5, 6);
+        let rsp = prepare_ring3_stack(buf, frame).expect("stack big enough");
+        let top = buf.as_ptr() as u64 + buf.len() as u64;
+        let id = sched.add_user_task("hello", 5, rsp, top, buf.len(), 0x400040);
+        let t = sched.task(id).unwrap();
+        assert_eq!(t.id, id);
+        assert_eq!(t.name, "hello");
+        assert_eq!(t.state, TaskState::Ready);
+        assert_eq!(t.context.rip, 0x400040);
+        assert_eq!(t.context.rsp, rsp);
+        assert_eq!(t.stack_top, top);
+        assert_eq!(t.stack_bottom(), top - 16384);
+        assert!(t.stack_contains(t.context.rsp));
+        // The prepared stack really holds the iretq frame: after
+        // the pops and ret, rsp lands on the frame's RIP slot.
+        let frame_addr = t.context.rsp as usize + 7 * 8;
+        assert_eq!(unsafe { *(frame_addr as *const u64) }, 0x400040);
+    }
+
+    #[test]
+    fn has_live_user_task_tracks_userspace_lifetime() {
+        // No tasks at all: nobody owns the keyboard.
+        let mut sched = Scheduler::new();
+        assert!(!sched.has_live_user_task());
+        // Kernel tasks only (idle + worker): the idle loop keeps
+        // echoing — the worker never reads stdin.
+        let (mut sched, _ids) = sched_with_tasks(&[("idle", 5), ("worker", 5)]);
+        assert!(!sched.has_live_user_task());
+        // A live user task claims the keyboard.
+        let buf = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 16384]));
+        use crate::context::{prepare_ring3_stack, Ring3Frame};
+        let frame = Ring3Frame::new(0x800000, 0xbfff_e8, 5, 6);
+        let rsp = prepare_ring3_stack(buf, frame).expect("stack big enough");
+        let top = buf.as_ptr() as u64 + buf.len() as u64;
+        let sh = sched.add_user_task("sh", 5, rsp, top, buf.len(), 0x800000);
+        assert!(sched.has_live_user_task());
+        // A second user task does not change it; terminating one
+        // leaves it true while the other lives.
+        let buf2 = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 16384]));
+        let frame2 = Ring3Frame::new(0x400000, 0x7fff_e8, 5, 6);
+        let rsp2 = prepare_ring3_stack(buf2, frame2).expect("stack big enough");
+        let top2 = buf2.as_ptr() as u64 + buf2.len() as u64;
+        let hello = sched.add_user_task("hello", 5, rsp2, top2, buf2.len(), 0x400000);
+        assert!(sched.has_live_user_task());
+        assert!(sched.exit(hello, 0));
+        assert!(sched.has_live_user_task());
+        // Terminating the last user task hands the keyboard back to
+        // the idle loop.
+        assert!(sched.exit(sh, 0));
+        assert!(!sched.has_live_user_task());
+    }
+
+    #[test]
+    fn add_task_stores_the_stack_range_it_was_given() {
+        // The boot log prints `stack_bottom()-stack_top` for each
+        // task (see the kernel's `init_tasks` snapshot) — exactly
+        // what this pins. On the 2026-11-22 live boot the worker
+        // printed `0x4444444402c0-0x4444444442c0`, which looked like
+        // a fill value but was the real heap address (the kernel
+        // heap starts at `0x444444440000`); the range, the size,
+        // and the allocation base must all agree, or the print is
+        // lying about the stack. If `add_task` were ever passed the
+        // prepared `rsp` as the top, or a wrong size, this fails.
+        let mut sched = Scheduler::new();
+        let buf = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 8192]));
+        let rsp = unsafe { Task::prepare_stack(buf.as_mut_ptr(), buf.len(), idle_entry) }
+            .expect("stack");
+        let top = buf.as_ptr() as u64 + buf.len() as u64;
+        let id = sched.add_task("w", 5, rsp, top, buf.len(), idle_entry);
+        let t = sched.task(id).unwrap();
+        assert_eq!(t.stack_top, top);
+        assert_eq!(t.stack_bottom(), top - 8192);
+        assert_eq!(t.stack_bottom(), buf.as_ptr() as u64);
+        assert_eq!(t.stack_size, 8192);
+        assert!(t.stack_contains(t.stack_bottom()));
+        assert!(t.stack_contains(top - 1));
+        assert!(!t.stack_contains(top));
+        // The prepared rsp sits just below the top (8 slots down
+        // from the 16-aligned top).
+        assert!(t.stack_contains(t.context.rsp));
+        assert_eq!(t.context.rsp, (top & !0xF) - 64);
+    }
+
+    #[test]
     fn pick_next_empty_is_none() {
         let mut sched = Scheduler::new();
         assert_eq!(sched.pick_next(), None);
@@ -425,6 +556,39 @@ mod tests {
         assert_eq!(sched.run_next(), Some(ids[0]));
         assert_eq!(sched.run_next(), Some(ids[1]));
         assert_eq!(sched.switches(), 5);
+    }
+
+    #[test]
+    fn idle_task_joins_round_robin_at_equal_priority() {
+        // Batch 8 (2026-11-22): the kernel's idle task starved
+        // forever once the worker and a userspace task were both
+        // Ready at priority 5 while idle sat at 0 — pick_next always
+        // prefers the higher priority, so kernel_main never ran
+        // again (no "hello task pid 2 created", no "RustOS kernel
+        // ready", no uptime). The kernel now creates idle at the
+        // same priority as the others; with equal priorities the
+        // round-robin must visit every task, idle included.
+        let (mut sched, ids) = sched_with_tasks(&[("idle", 5), ("worker", 5), ("hello", 5)]);
+        assert_eq!(sched.run_next(), Some(ids[0])); // idle
+        assert_eq!(sched.run_next(), Some(ids[1])); // worker
+        assert_eq!(sched.run_next(), Some(ids[2])); // hello
+        assert_eq!(sched.run_next(), Some(ids[0])); // idle again
+    }
+
+    #[test]
+    fn low_priority_task_starves_while_higher_priority_tasks_stay_ready() {
+        // The other half of the Batch 8 lesson: a priority-0 task is
+        // NEVER picked while any priority-5 task is Ready — the pick
+        // scans for the highest priority, and round-robin only
+        // applies within one priority. This is why the idle task
+        // must not sit below the always-Ready tasks; the scheduler
+        // offers no aging (see README).
+        let (mut sched, ids) = sched_with_tasks(&[("idle", 0), ("worker", 5), ("hello", 5)]);
+        assert_eq!(sched.run_next(), Some(ids[1])); // worker
+        assert_eq!(sched.run_next(), Some(ids[2])); // hello
+        assert_eq!(sched.run_next(), Some(ids[1])); // worker again
+        assert_eq!(sched.run_next(), Some(ids[2])); // hello again
+        assert_ne!(sched.current_id(), Some(ids[0]));
     }
 
     #[test]
@@ -569,5 +733,18 @@ mod tests {
         sched.exit(ids[1], 0);
         assert!(unsafe { sched.context_switch(ids[1]) }.is_none());
         let _ = other_entry;
+    }
+
+    #[test]
+    fn context_switch_must_run_before_switch_to() {
+        // The kernel's switch sequence is context_switch() THEN
+        // switch_to(): switch_to() moves the target to Running, and
+        // context_switch() only hands out pointers for Ready tasks.
+        // Calling them the other way round must yield no pointers.
+        let (mut sched, ids) = sched_with_tasks(&[("a", 5), ("b", 5)]);
+        sched.run_next(); // a runs
+        sched.switch_to(ids[1]); // b is Running now
+        assert!(unsafe { sched.context_switch(ids[1]) }.is_none());
+        assert_eq!(sched.current_id(), Some(ids[1]));
     }
 }

@@ -34,9 +34,22 @@ pub enum TaskState {
 }
 
 /// Entry point of a task: a plain function that never returns
-/// (it loops, halts, or calls the exit syscall). A `fn() -> !`
-/// coerces to this type.
+/// (it loops, halts, or calls the exit syscall). Declared `fn()`,
+/// not `fn() -> !`: a diverging fn item does not coerce to `fn()`
+/// in this toolchain, so entries are `fn()` whose bodies diverge
+/// (an infinite loop) instead.
 pub type TaskEntry = fn();
+
+/// Placeholder entry for ring-3 tasks (see [`Task::new_for_user`]):
+/// the first switch to such a task `ret`s into the iretq stub, not
+/// into this function, so it must never run. If it ever did, the
+/// safe behaviour is to spin forever — returning would `ret` into
+/// whatever sits above the (empty) stack.
+fn user_entry_placeholder() {
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 /// A task.
 #[derive(Debug)]
@@ -69,6 +82,13 @@ pub struct Task {
     pub blocked_on: Option<u32>,
     /// Exit code, once Terminated.
     pub exit_code: Option<i32>,
+    /// True for a ring-3 (userspace) task: its entry point is a raw
+    /// program address (not a Rust fn), its `stack_top` is the top
+    /// of its *kernel* stack (what `TSS.rsp[0]` points at when it
+    /// runs), and its faults and syscall buffers are handled as
+    /// user faults / user buffers (see `rustos-kernel`). False for
+    /// kernel tasks.
+    pub is_user: bool,
 }
 
 impl Task {
@@ -112,6 +132,46 @@ impl Task {
             quantum_left: ticks_per_timeslice(TICK_HZ),
             blocked_on: None,
             exit_code: None,
+            is_user: false,
+        }
+    }
+
+    /// Create a ring-3 (userspace) task whose entry point is a raw
+    /// address — a program's ELF entry — not a Rust function.
+    /// `initial_rsp` must be the value returned by
+    /// [`crate::context::prepare_ring3_stack`] for this task's
+    /// *kernel* stack; `stack_top` is that kernel stack's
+    /// one-past-the-end address (also what `TSS.rsp[0]` is set to
+    /// when this task runs, so privilege transitions land on it).
+    ///
+    /// The `entry` field holds a placeholder that is never called:
+    /// the first switch to this task `ret`s into the iretq stub
+    /// (see [`crate::context::prepare_ring3_stack`]), not into
+    /// `entry` — the real entry lives in `context.rip` (and in the
+    /// iretq frame on the initial stack).
+    pub fn new_for_user(
+        id: TaskId,
+        name: &'static str,
+        priority: u8,
+        initial_rsp: u64,
+        stack_top: u64,
+        stack_size: usize,
+        entry_rip: u64,
+    ) -> Self {
+        Task {
+            id,
+            name,
+            state: TaskState::Ready,
+            priority,
+            entry: user_entry_placeholder,
+            context: Context::new(entry_rip, initial_rsp),
+            stack_top,
+            stack_size,
+            ticks_run: 0,
+            quantum_left: ticks_per_timeslice(TICK_HZ),
+            blocked_on: None,
+            exit_code: None,
+            is_user: true,
         }
     }
 

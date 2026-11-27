@@ -94,6 +94,11 @@ behaviour, stack layout, and the syscall-number agreement with
   per-CPU run queues and locking.
 - **No aging / no starvation protection.** A steady stream of
   high-priority Ready tasks can starve lower-priority ones forever.
+  Consequence the kernel must respect (Batch 8, 2026-11-22): the
+  kernel's idle task runs at the same priority as the worker and
+  userspace tasks — at priority 0 it starved the moment the worker
+  and hello (both 5, always Ready) existed, and `kernel_main`
+  never resumed.
 - **Cooperative tasks can still hog the CPU** if they disable
   interrupts or spin with interrupts off — preemption only happens
   on a timer tick.

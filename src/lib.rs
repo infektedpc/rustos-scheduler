@@ -20,9 +20,11 @@
 //! The crate is `#![no_std]` outside tests (`core` + `alloc` only, no
 //! external crates), so it can link into `rustos-kernel`. All scheduling
 //! decisions are pure logic over the task list and are unit-tested on
-//! the host; only [`context::switch`] touches hardware, and it is
-//! deliberately *not* exercised by the unit tests (calling it on the
-//! host would jump to a fabricated stack).
+//! the host; [`context::switch`] and [`context::enter`] are exercised
+//! too, by a real round-trip between two prepared stacks on the host
+//! (see the context module's tests) — that test exists because a
+//! layout drift there wedged the first live boot of Batch 7, and a
+//! pure-logic test could not have caught it.
 //!
 //! # Wiring into the kernel
 //!
@@ -48,7 +50,10 @@ pub mod syscall;
 pub mod task;
 pub mod timer;
 
-pub use context::{prepare_initial_stack, switch, Context};
+pub use context::{
+    enter, prepare_initial_stack, prepare_ring3_stack, ring3_iretq_stub, switch, Context,
+    Ring3Frame, RING3_STACK_SLOTS,
+};
 pub use scheduler::{Scheduler, TickOutcome};
 pub use task::{Task, TaskId, TaskState};
 pub use timer::{Timer, TICK_HZ, TIMESLICE_MS};
